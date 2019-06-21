@@ -13,6 +13,45 @@
 include "NDFile.template"
 include "NDPluginBase.template"
 
+record(bo, "$(P)$(R)ReuseContainer")
+{
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))HDF5_reuseContainer")
+    field(PINI, "No")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+    field(VAL,  "0")
+    info(autosaveFields, "VAL")
+}
+
+record(bi, "$(P)$(R)ReuseContainer_RBV")
+{
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))HDF5_reuseContainer")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+}
+
+record(waveform, "$(P)$(R)insertionOrigin")
+{
+    field(PINI, "YES")
+    field(DTYP, "asynOctetWrite")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))HDF5_insertionOrigin")
+    field(FTVL, "CHAR")
+    field(NELM, "2048")
+    info(autosaveFields, "VAL")
+}
+
+record(waveform, "$(P)$(R)insertionOrigin_RBV")
+{
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))HDF5_insertionOrigin")
+    field(FTVL, "CHAR")
+    field(NELM, "2048")
+    field(SCAN, "I/O Intr")
+}
+
 # Flush data to file
 record(busy, "$(P)$(R)FlushNow")
 {

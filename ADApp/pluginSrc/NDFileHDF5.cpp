@@ -3,7 +3,14 @@
  *
  * Ulrik Kofoed Pedersen
  * March 20. 2011
+ * 
+ * Modifed by Darren Thompson
+ * Added support for HDF5 container reuse
+ * and insertion to a specifed group
+ * June 21, 2019
  */
+
+
 
 #define H5Gcreate_vers 2
 #define H5Dopen_vers 2
@@ -180,9 +187,13 @@ static void flushTaskC(void *drvPvt)
  */
 asynStatus NDFileHDF5::openFile(const char *fileName, NDFileOpenMode_t openMode, NDArray *pArray)
 {
-  int storeAttributes, storePerformance;
   static const char *functionName = "openFile";
+
+  int storeAttributes, storePerformance;
   int numCapture;
+  int reuseContainer;
+  char insertionOrigin[MAX_STRING_SIZE];
+
   asynStatus status = asynSuccess;
 
   asynPrint(this->pasynUserSelf, ASYN_TRACE_FLOW, "%s::%s Filename: %s\n", driverName, functionName, fileName);
@@ -194,6 +205,8 @@ asynStatus NDFileHDF5::openFile(const char *fileName, NDFileOpenMode_t openMode,
   getIntegerParam(NDFileNumCapture, &numCapture);
   getIntegerParam(NDFileHDF5_storeAttributes, &storeAttributes);
   getIntegerParam(NDFileHDF5_storePerformance, &storePerformance);
+  getIntegerParam(NDFileHDF5_reuseContainer, &reuseContainer);
+  getStringParam(NDFileHDF5_insertionOrigin, MAX_STRING_SIZE, insertionOrigin);
 
   // We don't support reading yet
   if (openMode & NDFileModeRead) {
@@ -206,7 +219,7 @@ asynStatus NDFileHDF5::openFile(const char *fileName, NDFileOpenMode_t openMode,
   if (openMode & NDFileModeAppend) {
     setIntegerParam(NDFileCapture, 0);
     setIntegerParam(NDWriteFile, 0);
-    status = asynError;
+    status = asynError; 
   }
 
   // Check if an invalid (<0) number of frames has been configured for capture
@@ -274,16 +287,45 @@ asynStatus NDFileHDF5::openFile(const char *fileName, NDFileOpenMode_t openMode,
     return asynError;
   }
 
-  // Create the new file
-  if (this->createNewFile(fileName)){
+  if (reuseContainer && this->fileExists(const_cast<char *>(fileName)))
+  {
+    if (this->openExistingFile(fileName))
+    {
+      asynPrint(this->pasynUserSelf, ASYN_TRACE_ERROR, 
+           "%s::%s ERROR Failed to existing output file\n",
+            driverName, functionName);
+
+    return asynError;
+    }
+  }
+  else if (this->createNewFile(fileName))
+  {
+    // Create the new file
     asynPrint(this->pasynUserSelf, ASYN_TRACE_ERROR, 
               "%s::%s ERROR Failed to create a new output file\n",
               driverName, functionName);
     return asynError;
   }
 
+  if (strlen(insertionOrigin))
+  {
+    // if an insertionOrigin is defined initialise the group
+    if (initialiseInsertionOrigin(insertionOrigin) )
+    {
+      asynPrint(this->pasynUserSelf, ASYN_TRACE_ERROR, 
+              "%s::%s ERROR Failed to initialise insertion group: %s\n",
+              driverName, functionName, insertionOrigin);
+      return asynError;      
+    }
+  }
+  else
+    // If no insertion origin is specified, set it to the
+    // current HDF5 file handle
+    this->insertionOrigin = this->file;
+
   // Now create the layout within the file
-  if (this->createFileLayout(pArray)){
+  if (this->createFileLayout(pArray))
+  {
     asynPrint(this->pasynUserSelf, ASYN_TRACE_ERROR, 
               "%s::%s ERROR Failed to create the specified file layout\n",
               driverName, functionName);
@@ -304,7 +346,6 @@ asynStatus NDFileHDF5::openFile(const char *fileName, NDFileOpenMode_t openMode,
   if (storeAttributes == 1){
     this->createAttributeDataset(pArray);
     this->writeAttributeDataset(hdf5::OnFileOpen, 0, NULL);
-
 
     // Store any attributes that have been marked as onOpen
     if (this->storeOnOpenAttributes()){
@@ -468,10 +509,12 @@ asynStatus NDFileHDF5::createXMLFileLayout()
             driverName, functionName,
             root->_str_().c_str());
 
-  retcode = this->createTree(root, this->file);
+  // Insert the tree in the HDF5 root
+  retcode = this->createTree(root, this->insertionOrigin);
 
   // Only proceed if there was no error in creating the tree
-  if (retcode == asynSuccess){
+  if (retcode == asynSuccess)
+  {
     // Attempt to search for a dataset with a default flag and record the dataset name.
     // If no default is found then set the first as the default.
     // If no datasets are found then this is an error.
@@ -569,7 +612,7 @@ asynStatus NDFileHDF5::storeOnOpenCloseAttribute(hdf5::Element *element, bool op
 
   hdf5::Element::MapAttributes_t::iterator it_attr;
   // Attempt to Open the Object, we do not know (or care?) if it is a group or dataset
-  hid_t hdf_id = H5Oopen(this->file, element->get_full_name().c_str(), H5P_DEFAULT);
+  hid_t hdf_id = H5Oopen(this->insertionOrigin, element->get_full_name().c_str(), H5P_DEFAULT);
   // For each element search for any attributes that match the pArray
   for (it_attr=element->get_attributes().begin(); it_attr != element->get_attributes().end(); ++it_attr){
     saveAttribute = false;
@@ -743,7 +786,7 @@ asynStatus NDFileHDF5::createHardLinks(hdf5::Group* root)
     for (it_hardlinks = hardlinks.begin(); it_hardlinks != hardlinks.end(); ++it_hardlinks){
       std::string targetName = it_hardlinks->second->get_target();
       std::string linkName = it_hardlinks->second->get_full_name();
-      herr_t err = H5Lcreate_hard(this->file, targetName.c_str(), this->file, linkName.c_str(), 0, 0);
+      herr_t err = H5Lcreate_hard(this->insertionOrigin, targetName.c_str(), this->insertionOrigin, linkName.c_str(), 0, 0);
       if (err < 0) {
         asynPrint(this->pasynUserSelf, ASYN_TRACE_ERROR, "%s::%s error creating hard link from: %s to %s\n",
                   driverName, functionName, targetName.c_str(), linkName.c_str());
@@ -1377,6 +1420,8 @@ asynStatus NDFileHDF5::writeFile(NDArray *pArray)
   double dt=0.0, period=0.0, runtime = 0.0;
   int extradims = 0;
   hsize_t offsets[MAXEXTRADIMS] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  char insertionOrigin[MAX_STRING_SIZE];
+
   static const char *functionName = "writeFile";
 
   // Take the flushing lock here, we do not let a manual flush occur
@@ -1409,6 +1454,7 @@ asynStatus NDFileHDF5::writeFile(NDArray *pArray)
   getStringParam(NDFileHDF5_posName[7], MAX_STRING_SIZE, posName[7]);
   getStringParam(NDFileHDF5_posName[8], MAX_STRING_SIZE, posName[8]);
   getStringParam(NDFileHDF5_posName[9], MAX_STRING_SIZE, posName[9]);
+  getStringParam(NDFileHDF5_insertionOrigin, MAX_STRING_SIZE, insertionOrigin);
   this->unlock();
 
   if (numCaptured == 1) epicsTimeGetCurrent(&this->firstFrame);
@@ -1544,12 +1590,24 @@ asynStatus NDFileHDF5::writeFile(NDArray *pArray)
                 "%s::%s ERROR: Datatype did not close cleanly.\n",
                 driverName, functionName);
     }
+
+    if (strlen(insertionOrigin))
+    {
+      hdfstatus = H5Gclose(this->insertionOrigin);
+      if (hdfstatus){
+        asynPrint(this->pasynUserSelf, ASYN_TRACE_ERROR,
+                  "%s::%s ERROR: Insertion origin did not close cleanly.\n",
+                  driverName, functionName);
+      }
+    }
+
     hdfstatus = H5Fclose(this->file);
     if (hdfstatus){
       asynPrint(this->pasynUserSelf, ASYN_TRACE_ERROR,
                 "%s::%s ERROR: File did not close cleanly.\n",
                 driverName, functionName);
     }
+    this->insertionOrigin = 0;
     this->file = 0;
     this->lock();
     setIntegerParam(NDFileCapture, 0);
@@ -1643,10 +1701,12 @@ asynStatus NDFileHDF5::readFile(NDArray **pArray)
  */ 
 asynStatus NDFileHDF5::closeFile()
 {
-  int storeAttributes, storePerformance;
+  int storeAttributes, storePerformance, reuseContainer;
   epicsTimeStamp now;
   double runtime = 0.0, writespeed = 0.0;
   epicsInt32 numCaptured;
+  char insertionOrigin[MAX_STRING_SIZE];
+
   static const char *functionName = "closeFile";
 
   if (this->file == 0){
@@ -1659,13 +1719,19 @@ asynStatus NDFileHDF5::closeFile()
   this->lock();
   getIntegerParam(NDFileHDF5_storeAttributes, &storeAttributes);
   getIntegerParam(NDFileHDF5_storePerformance, &storePerformance);
+  getIntegerParam(NDFileHDF5_reuseContainer, &reuseContainer);
+  getStringParam(NDFileHDF5_insertionOrigin, MAX_STRING_SIZE, insertionOrigin);
   this->unlock();
-  if (storeAttributes == 1) {
+  
+  if (storeAttributes == 1) 
+  {
      this->writeAttributeDataset(hdf5::OnFileClose, 0, NULL);
      this->storeOnCloseAttributes();
      this->closeAttributeDataset();
   }
-  if (storePerformance == 1) this->writePerformanceDataset();
+  
+  if (storePerformance == 1) 
+    this->writePerformanceDataset();
 
   asynPrint(this->pasynUserSelf, ASYN_TRACE_FLOW, 
             "%s::%s closing HDF cparms %ld\n", 
@@ -1699,6 +1765,17 @@ asynStatus NDFileHDF5::closeFile()
   for (it_hid = this->attDataMap.begin(); it_hid != this->attDataMap.end(); ++it_hid){
     H5Dclose(it_hid->second);
   }
+
+  if (strlen(insertionOrigin))
+  {
+      asynPrint(this->pasynUserSelf, ASYN_TRACE_FLOW, 
+            "%s::%s closing HDF insertionOrigin %s\n", 
+            driverName, functionName, insertionOrigin);
+
+      H5Gclose(this->insertionOrigin);
+  } 
+
+  this->insertionOrigin = 0;  
 
   // Just before closing the file lets ensure there are no hanging references
   int obj_count = (int)H5Fget_obj_count(this->file, H5F_OBJ_GROUP);
@@ -2272,6 +2349,8 @@ NDFileHDF5::NDFileHDF5(const char *portName, int queueSize, int blockingCallback
 {
   static const char *functionName = "NDFileHDF5";
   int status = asynSuccess;
+  this->createParam(str_NDFileHDF5_reuseContainer,   asynParamInt32,   &NDFileHDF5_reuseContainer);
+  this->createParam(str_NDFileHDF5_insertionOrigin,   asynParamOctet,   &NDFileHDF5_insertionOrigin);
 
   this->createParam(str_NDFileHDF5_chunkSizeAuto,   asynParamInt32,   &NDFileHDF5_chunkSizeAuto);
   this->createParam(str_NDFileHDF5_nFramesChunks,   asynParamInt32,   &NDFileHDF5_nFramesChunks);
@@ -2318,6 +2397,9 @@ NDFileHDF5::NDFileHDF5(const char *portName, int queueSize, int blockingCallback
   this->createParam(str_NDFileHDF5_SWMRSupported,   asynParamInt32,   &NDFileHDF5_SWMRSupported);
   this->createParam(str_NDFileHDF5_SWMRMode,        asynParamInt32,   &NDFileHDF5_SWMRMode);
   this->createParam(str_NDFileHDF5_SWMRRunning,     asynParamInt32,   &NDFileHDF5_SWMRRunning);
+
+  setIntegerParam(NDFileHDF5_reuseContainer, 0);
+  setStringParam (NDFileHDF5_insertionOrigin,  "");
 
   setIntegerParam(NDFileHDF5_chunkSizeAuto, 1);
   for (int chunkIndex = 0; chunkIndex < MAX_CHUNK_DIMS; chunkIndex++){
@@ -2405,6 +2487,7 @@ NDFileHDF5::NDFileHDF5(const char *portName, int queueSize, int blockingCallback
   this->virtualdims  = NULL;
   this->rank         = 0;
   this->file         = 0;
+  this->insertionOrigin = 0;
   this->ptrFillValue = (void*)calloc(8, sizeof(char));
   this->dimsreport   = (char*)calloc(DIMSREPORTSIZE, sizeof(char));
   this->performanceBuf       = NULL;
@@ -2617,14 +2700,14 @@ asynStatus NDFileHDF5::createPerformanceDataset()
     {
       // Check if the auto_ndattr_default tag is true, if it is then the root group is the file
       if (this->layout.getAutoNDAttrDefault()){
-        group_performance = this->file;
+        group_performance = this->insertionOrigin;
       } else {
         asynPrint(this->pasynUserSelf, ASYN_TRACE_WARNING, "%s::writePerformanceDataset No default attribute group defined.\n",
                   driverName);
         return asynError;
       }
     } else {
-      group_performance = H5Gopen(this->file, perf_group->get_full_name().c_str(), H5P_DEFAULT);
+      group_performance = H5Gopen(this->insertionOrigin, perf_group->get_full_name().c_str(), H5P_DEFAULT);
     }
 
     int chunking = 0;
@@ -2758,7 +2841,7 @@ asynStatus NDFileHDF5::createAttributeDataset(NDArray *pArray)
   hdf5::Group* def_group = root->find_ndattr_default_group();
   //check for NULL
   if(def_group != NULL) {
-    groupDefault = H5Gopen(this->file, def_group->get_full_name().c_str(), H5P_DEFAULT);
+    groupDefault = H5Gopen(this->insertionOrigin, def_group->get_full_name().c_str(), H5P_DEFAULT);
     if (strlen(this->hostname) > 0) {
       this->writeStringAttribute(groupDefault, "hostname", this->hostname);
     }
@@ -2766,7 +2849,7 @@ asynStatus NDFileHDF5::createAttributeDataset(NDArray *pArray)
   else {
     // Check if the auto_ndattr_default tag is true, if it is then the root group is the file
     if (this->layout.getAutoNDAttrDefault()){
-      groupDefault = this->file;
+      groupDefault = this->insertionOrigin;
     } else {
       asynPrint(this->pasynUserSelf, ASYN_TRACE_WARNING, "%s::%s No default attribute group defined.\n",
                 driverName, functionName);
@@ -2788,7 +2871,7 @@ asynStatus NDFileHDF5::createAttributeDataset(NDArray *pArray)
 
       hdf5::DataSource dsource = dset->data_source();
       std::string atName = std::string(ndAttr->getName());
-      NDFileHDF5AttributeDataset *attDset = new NDFileHDF5AttributeDataset(this->file, atName, ndAttr->getDataType());
+      NDFileHDF5AttributeDataset *attDset = new NDFileHDF5AttributeDataset(this->insertionOrigin, atName, ndAttr->getDataType());
       attDset->setDsetName(dset->get_name());
       attDset->setWhenToSave(dsource.get_when_to_save());
       attDset->setParentGroupName(dset->get_parent()->get_full_name());
@@ -2821,7 +2904,7 @@ asynStatus NDFileHDF5::createAttributeDataset(NDArray *pArray)
     } else {
       if(groupDefault > -1) {
         std::string atName = std::string(ndAttr->getName());
-        NDFileHDF5AttributeDataset *attDset = new NDFileHDF5AttributeDataset(this->file, atName, ndAttr->getDataType());
+        NDFileHDF5AttributeDataset *attDset = new NDFileHDF5AttributeDataset(this->insertionOrigin, atName, ndAttr->getDataType());
         if(def_group != NULL) {
           attDset->setParentGroupName(def_group->get_full_name().c_str());
         }
@@ -3726,17 +3809,17 @@ asynStatus NDFileHDF5::writeDefaultDatasetAttributes(NDArray *pArray)
   return ret;
 }
 
-asynStatus NDFileHDF5::createNewFile(const char *fileName)
+hid_t NDFileHDF5::createFileAccessPlist()
 {
   herr_t hdfstatus;
   int tempAlign = 0;
   int tempThreshold = 0;
   int SWMRMode = 0;
-  static const char *functionName = "createNewFile";
+  static const char *functionName = "createFileAccessPlist";
 
   this->lock();
   getIntegerParam(NDFileHDF5_chunkBoundaryAlign, &tempAlign);
-  getIntegerParam(NDFileHDF5_chunkBoundaryThreshold, (int*)&tempThreshold);
+  getIntegerParam(NDFileHDF5_chunkBoundaryThreshold, (int *)&tempThreshold);
   // Check if we are in SWMR mode
   getIntegerParam(NDFileHDF5_SWMRMode, &SWMRMode);
   this->unlock();
@@ -3746,20 +3829,24 @@ asynStatus NDFileHDF5::createNewFile(const char *fileName)
    * If user sets size to 0 we do not set alignment at all. */
   hid_t access_plist = H5Pcreate(H5P_FILE_ACCESS);
   hsize_t align = 0;
-  if (tempAlign > 0){
+  if (tempAlign > 0)
+  {
     align = tempAlign;
   }
   hsize_t threshold = 0;
-  if (tempThreshold > 0){
+  if (tempThreshold > 0)
+  {
     threshold = tempThreshold;
   }
-  if (align > 0){
-    hdfstatus = H5Pset_alignment( access_plist, threshold, align );
-    if (hdfstatus < 0){
+  if (align > 0)
+  {
+    hdfstatus = H5Pset_alignment(access_plist, threshold, align);
+    if (hdfstatus < 0)
+    {
       asynPrint(this->pasynUserSelf, ASYN_TRACE_ERROR,
-          "%s%s Warning: failed to set boundary threshod=%llu and alignment=%llu bytes\n",
-          driverName, functionName, threshold, align);
-      H5Pget_alignment( access_plist, &threshold, &align );
+                "%s%s Warning: failed to set boundary threshod=%llu and alignment=%llu bytes\n",
+                driverName, functionName, threshold, align);
+      H5Pget_alignment(access_plist, &threshold, &align);
       this->lock();
       setIntegerParam(NDFileHDF5_chunkBoundaryAlign, (int)align);
       setIntegerParam(NDFileHDF5_chunkBoundaryThreshold, (int)threshold);
@@ -3769,11 +3856,12 @@ asynStatus NDFileHDF5::createNewFile(const char *fileName)
 
   /* File creation property list: set the i-storek according to HDF group recommendations */
   H5Pset_fclose_degree(access_plist, H5F_CLOSE_STRONG);
-  
-  // Not required if SWMR is not supported
-  #if H5_VERSION_GE(1,9,178)
 
-  if (SWMRMode == 1){
+// Not required if SWMR is not supported
+#if H5_VERSION_GE(1, 9, 178)
+
+  if (SWMRMode == 1)
+  {
     // Setup the flushing callback
     H5Pset_object_flush_cb(access_plist, cFlushCallback, this);
 
@@ -3781,18 +3869,27 @@ asynStatus NDFileHDF5::createNewFile(const char *fileName)
     H5Pset_libver_bounds(access_plist, H5F_LIBVER_LATEST, H5F_LIBVER_LATEST);
   }
 
-  #endif
-  
+#endif
+
+  return access_plist;
+}
+
+hid_t NDFileHDF5::createFileCreatePlist()
+{
+  herr_t hdfstatus;
+  static const char *functionName = "createFileCreatePlist";
   hid_t create_plist = H5Pcreate(H5P_FILE_CREATE);
-  
+
   // We only need to calculate an istorek value if we are not in SWMR mode
-  if (checkForSWMRMode() == false){ 
+  if (checkForSWMRMode() == false)
+  {
     unsigned int istorek = this->calcIstorek();
     asynPrint(this->pasynUserSelf, ASYN_TRACE_FLOW,
               "%s::%s Calculated istorek=%u\n",
               driverName, functionName, istorek);
     // Check if the calculated value of istorek is greater than the maximum allowed
-    if (istorek > MAX_ISTOREK){
+    if (istorek > MAX_ISTOREK)
+    {
       // Cap the value at the maximum and notify of this
       istorek = MAX_ISTOREK;
       asynPrint(this->pasynUserSelf, ASYN_TRACE_WARNING,
@@ -3800,15 +3897,19 @@ asynStatus NDFileHDF5::createNewFile(const char *fileName)
                 driverName, functionName, istorek, istorek);
     }
     // Only set the istorek value if it is valid
-    if (istorek <= 1){
+    if (istorek <= 1)
+    {
       // Do not set this value as istorek, simply raise a warning
       asynPrint(this->pasynUserSelf, ASYN_TRACE_WARNING,
                 "%s::%s Istorek is %u, using default\n",
                 driverName, functionName, istorek);
-    } else {
+    }
+    else
+    {
       // We should have a valid istorek value, submit it and check the result
       hdfstatus = H5Pset_istore_k(create_plist, istorek);
-      if (hdfstatus < 0){
+      if (hdfstatus < 0)
+      {
         asynPrint(this->pasynUserSelf, ASYN_TRACE_ERROR,
                   "%s%s Warning: failed to set istorek parameter = %u\n",
                   driverName, functionName, istorek);
@@ -3816,10 +3917,22 @@ asynStatus NDFileHDF5::createNewFile(const char *fileName)
     }
   }
 
+  return create_plist;
+}
+
+asynStatus NDFileHDF5::createNewFile(const char *fileName)
+{
+  static const char *functionName = "createNewFile";
+
+  hid_t access_plist = createFileAccessPlist();
+  hid_t create_plist = createFileCreatePlist();
+
   this->file = H5Fcreate(fileName, H5F_ACC_TRUNC, create_plist, access_plist);
-  if (this->file <= 0){
+
+  if (this->file <= 0)
+  {
     asynPrint(this->pasynUserSelf, ASYN_TRACE_ERROR,
-              "%s::%s Unable to create HDF5 file: %s\n", 
+              "%s::%s Unable to open HDF5 file: %s\n",
               driverName, functionName, fileName);
     this->file = 0;
     H5Pclose(create_plist);
@@ -3828,6 +3941,110 @@ asynStatus NDFileHDF5::createNewFile(const char *fileName)
   }
   H5Pclose(create_plist);
   H5Pclose(access_plist);
+  return asynSuccess;
+}
+
+asynStatus NDFileHDF5::openExistingFile(const char *fileName)
+{
+  static const char *functionName = "openExistingFile";
+
+  hid_t access_plist = createFileAccessPlist();
+
+  this->file = H5Fopen(fileName, H5F_ACC_RDWR, H5P_DEFAULT);
+
+  if (this->file <= 0)
+  {
+    asynPrint(this->pasynUserSelf, ASYN_TRACE_ERROR,
+              "%s::%s Unable to open HDF5 file: %s\n",
+              driverName, functionName, fileName);
+    this->file = 0;
+    H5Pclose(access_plist);
+    return asynError;
+  }
+  H5Pclose(access_plist);
+  return asynSuccess;
+}
+
+int NDFileHDF5::getGroupPathNames(const char *groupPath, std::vector<std::string> &vecNames)
+{
+    static const char *strGroupPathDelimiter = "/";
+    char strGroupPathCopy[strlen(groupPath) + 1];
+
+    strcpy(strGroupPathCopy, groupPath);
+
+    char *p(strtok(strGroupPathCopy, strGroupPathDelimiter));
+    while (p)
+    {
+        vecNames.push_back(std::string(p));
+        p = strtok(NULL, strGroupPathDelimiter);
+    }
+
+    return vecNames.size();
+}
+
+asynStatus NDFileHDF5::initialiseInsertionOrigin(const char *insertionOrigin)
+{
+  const char* functionName = "initialiseinsertionOrigin";
+
+  hid_t parent(this->file);
+  hid_t group(0); 
+  std::vector<std::string> vecGroupNames;
+
+  // Firstly check if the specified insertion group already exists, 
+  // if so then fail as we don't want to overwrite an existing group
+  if (!H5Lget_info(this->file, insertionOrigin, 0, H5P_DEFAULT))
+  {
+      asynPrint(this->pasynUserSelf, ASYN_TRACE_ERROR, 
+          "%s::%s ERROR insertion orgin already exists: %s\n",
+          driverName, functionName, insertionOrigin);
+      return asynError;
+  }
+
+  // Construct a vector of individual group names that comprise the group path
+  getGroupPathNames( insertionOrigin, vecGroupNames);
+
+  // Iterate through group names */
+  for (std::vector<std::string>::const_iterator i = vecGroupNames.begin(); i != vecGroupNames.end(); i++)
+  {
+    // Test for the existence of the specified container group
+    if (H5Lget_info(parent, (*i).c_str(), 0, H5P_DEFAULT))
+    {
+      // Group doesn't exist, create it
+      group = H5Gcreate(parent, (*i).c_str(), H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+
+      if( group <= 0 )
+      {
+        asynPrint(this->pasynUserSelf, ASYN_TRACE_ERROR, 
+            "%s::%s ERROR Failed to create group: %s\n",
+            driverName, functionName, (*i).c_str());
+        return asynError;
+      }
+    }
+    else
+    {
+      group = H5Gopen(parent, (*i).c_str(), H5P_DEFAULT);
+
+      if( group <= 0 )
+      {
+        asynPrint(this->pasynUserSelf, ASYN_TRACE_ERROR, 
+            "%s::%s ERROR Failed to open group: %s\n",
+            driverName, functionName, (*i).c_str());
+        return asynError;
+      }      
+    }
+
+    if (parent != this->file)
+      // Close any intermediate groups
+      H5Gclose(parent);
+
+    // Update the parent
+    parent = group;
+  }
+
+  // On succesful completion of the above loop, parent/group should contain the handle
+  // to the desired insertion group
+  this->insertionOrigin = parent;
+
   return asynSuccess;
 }
 
